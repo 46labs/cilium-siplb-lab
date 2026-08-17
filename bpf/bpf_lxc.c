@@ -553,6 +553,9 @@ int NAME(struct __ctx_buff *ctx)						\
 	tuple->daddr = ip4->daddr;						\
 	tuple->saddr = ip4->saddr;						\
 	tuple->sip_call_id_hash = sip_inspect(ctx);				\
+	/* sip_inspect() may linearize the skb and invalidate packet pointers. */	\
+	if (!revalidate_data(ctx, &data, &data_end, &ip4))			\
+		return drop_for_direction(ctx, DIR, DROP_INVALID, ext_err);	\
 	ct_buffer.l4_off = ETH_HLEN + ipv4_hdrlen(ip4);				\
 										\
 	map = select_ct_map4(ctx, DIR, tuple);					\

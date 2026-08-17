@@ -7,6 +7,82 @@
 
 #define NOT_FOUND 0
 
+/* sip_inspect() uses direct packet access. TC skbs received after tunnel
+ * decapsulation may keep the SIP payload outside the linear head, even though
+ * skb_load_bytes() can still read the SIP method. Pull only the parser window
+ * that can actually be inspected: 1000 bytes while looking for Call-ID, the
+ * 9-byte header itself and the 68-byte Call-ID bounds window.
+ */
+#define SIP_L3_HEADERS_LEN (sizeof(struct ethhdr) + sizeof(struct iphdr))
+#define SIP_PAYLOAD_OFFSET (SIP_L3_HEADERS_LEN + sizeof(struct udphdr))
+#define SIP_METHOD_LEN 10
+#define SIP_PARSE_WINDOW (SIP_PAYLOAD_OFFSET + 1000 + 9 + 68)
+
+/* Temporary canary diagnostics. Removed after the failing path is isolated. */
+struct sip_debug_key {
+	__be32 saddr;
+	__be32 daddr;
+	__u32 hash;
+	__u8 stage;
+	__u8 pad[3];
+};
+
+struct sip_debug_value {
+	__u32 full_len;
+	__u32 linear_len;
+	__s32 result;
+	__u32 aux;
+	__be16 ip_id;
+	__be16 sport;
+	__be16 dport;
+	__u16 pad;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__type(key, struct sip_debug_key);
+	__type(value, struct sip_debug_value);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+	__uint(max_entries, 8192);
+} cilium_sip_dbg __section_maps_btf;
+
+static __noinline __maybe_unused void
+sip_debug_record(struct __ctx_buff *ctx, __u8 stage, __s32 result,
+		 __u32 hash, __u32 aux)
+{
+	struct sip_debug_value value = {
+		.full_len = (__u32)ctx_full_len(ctx),
+		.result = result,
+		.aux = aux,
+	};
+	struct sip_debug_key key = {
+		.hash = hash,
+		.stage = stage,
+	};
+	struct iphdr iph = {};
+	struct udphdr udp = {};
+	void *data = ctx_data(ctx);
+	void *data_end = ctx_data_end(ctx);
+
+	value.linear_len = (__u32)(data_end - data);
+	if (ctx_load_bytes(ctx, sizeof(struct ethhdr), &iph, sizeof(iph)) < 0 ||
+	    iph.protocol != IPPROTO_UDP ||
+	    ctx_load_bytes(ctx, SIP_L3_HEADERS_LEN, &udp, sizeof(udp)) < 0)
+		return;
+
+	/* Keep the temporary map focused on SIP signaling. */
+	if (udp.source != bpf_htons(5060) && udp.source != bpf_htons(6000) &&
+	    udp.dest != bpf_htons(5060) && udp.dest != bpf_htons(6000))
+		return;
+
+	key.saddr = iph.saddr;
+	key.daddr = iph.daddr;
+	value.ip_id = iph.id;
+	value.sport = udp.source;
+	value.dport = udp.dest;
+	map_update_elem(&cilium_sip_dbg, &key, &value, BPF_ANY);
+}
+
 static inline __u8 is_sip(const char *cur, const char *data_end)
 {
 	static const __u64 resp = 0x20302e322f706973; // "sip/2.0 "
@@ -89,19 +165,20 @@ __noinline __weak __u32 sip_inspect(struct __ctx_buff *ctx)
 
 	void *data, *data_end;
 	struct ethhdr *eth = NULL;
-	struct udphdr *udp = NULL;
 	struct iphdr *iph = NULL;
 	__u32 hash = 0x811c9dc5;
 	__u32 fnv_prime = 0x01000193;
+	__u64 method[2] = {};
+	__u32 pull_len;
 
 	data = (void *)(long)ctx->data;
 	data_end = (void *)(long)ctx->data_end;
 
-	if (data + 32 >= data_end)
+	if (data + SIP_L3_HEADERS_LEN > data_end)
 		return NOT_FOUND;
 
 	eth = data;
-	if ((void *)(eth + 1) >= data_end)
+	if ((void *)(eth + 1) > data_end)
 		return NOT_FOUND;
 
 	if (eth->h_proto != bpf_htons(ETH_P_IP))
@@ -112,20 +189,41 @@ __noinline __weak __u32 sip_inspect(struct __ctx_buff *ctx)
 	if (iph->protocol != IPPROTO_UDP)
 		return NOT_FOUND;
 
-	if ((void *)(iph + 1) >= data_end)
+	if ((void *)(iph + 1) > data_end)
 		return NOT_FOUND;
 
-	udp = (void *)(iph + 1);
-
-	if ((void *)(udp + 1) >= data_end)
+	void *cur = data + SIP_PAYLOAD_OFFSET;
+	if (cur + SIP_METHOD_LEN > data_end) {
+		/* skb_load_bytes() can read non-linear data without invalidating
+		 * packet pointers. Only linearize the larger parser window after
+		 * confirming that this is actually SIP.
+		 */
+		if (ctx_load_bytes(ctx, SIP_PAYLOAD_OFFSET, method,
+				   SIP_METHOD_LEN) < 0 ||
+		    !is_sip((char *)method, (char *)method + SIP_METHOD_LEN))
+			return NOT_FOUND;
+	} else if (!is_sip(cur, data_end)) {
 		return NOT_FOUND;
+	}
 
-	void *cur = (void *)(udp + 1);
-	if (cur >= data_end)
-		return NOT_FOUND;
+	/* The scan below uses direct access too. A decapsulated skb may have only
+	 * its headers linear even though the complete SIP message is present.
+	 */
+	pull_len = (__u32)ctx_full_len(ctx);
+	if (pull_len > SIP_PARSE_WINDOW)
+		pull_len = SIP_PARSE_WINDOW;
+	if (data + pull_len > data_end) {
+		if (ctx_pull_data(ctx, pull_len) < 0)
+			return NOT_FOUND;
 
-	if (!is_sip(cur, data_end))
-		return NOT_FOUND;
+		data = (void *)(long)ctx->data;
+		data_end = (void *)(long)ctx->data_end;
+
+		if (data + SIP_PAYLOAD_OFFSET + SIP_METHOD_LEN > data_end)
+			return NOT_FOUND;
+
+		cur = data + SIP_PAYLOAD_OFFSET;
+	}
 
 	int found = 0;
 

@@ -386,6 +386,11 @@ static __always_inline int nodeport_snat_fwd_ipv4(struct __ctx_buff *ctx,
 
 	if (target.sip_needed) {
 		tuple.sip_call_id_hash = sip_inspect(ctx);
+		sip_debug_record(ctx, 30, 0, tuple.sip_call_id_hash,
+				 target.addr);
+		/* sip_inspect() may linearize the skb and invalidate packet pointers. */
+		if (!revalidate_data(ctx, &data, &data_end, &ip4))
+			return DROP_INVALID;
 	}
 
 #if defined(ENABLE_EGRESS_GATEWAY_COMMON) && defined(IS_BPF_HOST)
@@ -410,6 +415,9 @@ apply_snat:
 	*saddr = tuple.saddr;
 	ret = snat_v4_nat(ctx, &tuple, ip4, fraginfo, l4_off,
 			  &target, trace, ext_err);
+	if (target.sip_needed)
+		sip_debug_record(ctx, 31, ret, tuple.sip_call_id_hash,
+				 target.addr);
 	if (IS_ERR(ret))
 		goto out;
 
@@ -474,6 +482,7 @@ nodeport_rev_dnat_fwd_ipv4(struct __ctx_buff *ctx, bool *snat_done,
 	void *data, *data_end;
 	struct iphdr *ip4;
 	fraginfo_t fraginfo;
+	bool has_rev_dnat;
 	__u32 monitor = 0;
 
 	if (!revalidate_data(ctx, &data, &data_end, &ip4))
@@ -481,6 +490,17 @@ nodeport_rev_dnat_fwd_ipv4(struct __ctx_buff *ctx, bool *snat_done,
 
 	fraginfo = ipfrag_encode_ipv4(ip4);
 	l4_off = ETH_HLEN + ipv4_hdrlen(ip4);
+
+	/* UDP 5-tuples are routinely reused by SIP peers. Include the Call-ID
+	 * before looking for a NodePort reply entry, otherwise an unrelated SIP
+	 * dialog can trigger RevDNAT and suppress the EgressGW SNAT mapping which
+	 * pins replies to their original LB backend.
+	 */
+	tuple.sip_call_id_hash = sip_inspect(ctx);
+	sip_debug_record(ctx, 40, 0, tuple.sip_call_id_hash, 0);
+	/* sip_inspect() may linearize the skb and invalidate packet pointers. */
+	if (!revalidate_data(ctx, &data, &data_end, &ip4))
+		return DROP_INVALID;
 
 	ret = lb4_extract_tuple(ctx, ip4, fraginfo, l4_off, &tuple);
 	if (ret < 0) {
@@ -490,7 +510,10 @@ nodeport_rev_dnat_fwd_ipv4(struct __ctx_buff *ctx, bool *snat_done,
 		return ret;
 	}
 
-	if (!nodeport_rev_dnat_get_info_ipv4(ctx, &tuple, &nat_info))
+	has_rev_dnat = nodeport_rev_dnat_get_info_ipv4(ctx, &tuple, &nat_info);
+	sip_debug_record(ctx, 41, has_rev_dnat, tuple.sip_call_id_hash,
+			 has_rev_dnat ? nat_info.address : 0);
+	if (!has_rev_dnat)
 		return CTX_ACT_OK;
 
 #if defined(IS_BPF_HOST)

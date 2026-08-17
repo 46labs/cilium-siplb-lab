@@ -178,11 +178,12 @@ egress_gw_request_needs_redirect(struct ipv4_ct_tuple *rtuple __maybe_unused,
 
 static __always_inline
 bool egress_gw_sip_inspection_needed(__be32 saddr __maybe_unused,
-				     __be32 daddr __maybe_unused, __u16 *sport)
+				     __be32 daddr __maybe_unused,
+				     __u8 tos __maybe_unused, __u16 *sport)
 {
 	const struct egress_gw_policy_entry *egress_gw_policy;
 
-	egress_gw_policy = lookup_ip4_egress_gw_policy(saddr, daddr, 0);
+	egress_gw_policy = lookup_ip4_egress_gw_policy(saddr, daddr, tos);
 	if (!egress_gw_policy)
 		return false;
 
@@ -559,10 +560,19 @@ int egress_gw_handle_request(struct __ctx_buff *ctx, __be16 proto,
 			return ret;
 		}
 
-		/* Only handle outbound connections: */
+		/* Outside-initiated connections normally bypass the egress gateway.
+		 * SIP load balancers are the exception: their replies must reach the
+		 * selected gateway so it can create the Call-ID reverse NAT entry that
+		 * keeps every subsequent packet on the same LB backend.
+		 */
 		is_reply = ct_is_reply4(get_ct_map4(&tuple4), &tuple4);
-		if (is_reply)
-			return CTX_ACT_OK;
+		if (is_reply) {
+			__u16 sip_port;
+
+			if (!egress_gw_sip_inspection_needed(ip4->saddr, ip4->daddr,
+							 ip4->tos, &sip_port))
+				return CTX_ACT_OK;
+		}
 
 		src_ep = __lookup_ip4_endpoint(ip4->saddr);
 		if (src_ep)

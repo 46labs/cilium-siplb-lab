@@ -8,6 +8,7 @@
 /* Enable code paths under test */
 #define ENABLE_IPV4
 #define ENABLE_NODEPORT
+#define ENABLE_MASQUERADE_IPV4 1
 
 #define TUNNEL_PROTOCOL		TUNNEL_PROTOCOL_VXLAN
 #define ENCAP_IFINDEX		42
@@ -301,6 +302,105 @@ int nodeport_overlay_nat_2_reply_check(const struct __ctx_buff *ctx)
 		test_fatal("no tunnel key set");
 
 	assert(identity_is_remote_node(tunnel_key->tunnel_id));
+
+	test_finish();
+}
+
+/* Reproduce the production SIP path where service pinning tunnels a reply to
+ * the original LB node and the packet enters through cil_from_overlay. The
+ * service fallback intentionally points at LB4; the pre-service SIP reverse
+ * NAT lookup must restore LB3 instead.
+ */
+#define SIP_LB3_IP              IPV4(10, 244, 6, 114)
+#define SIP_LB3_PORT            __bpf_htons(6000)
+#define SIP_LB4_IP              IPV4(10, 244, 5, 210)
+#define SIP_PEER_IP             IPV4(95, 216, 211, 90)
+#define SIP_PEER_PORT           __bpf_htons(63644)
+#define SIP_VIP_IP              IPV4(23, 29, 18, 180)
+#define SIP_PORT                __bpf_htons(5060)
+#define SIP_CALL_ID_HASH        0xfaf06e38
+#define SIP_CALL_ID             "devdev01-JmwcpDSf5oPQJQOZRa0fKLH35oNP1iR3"
+#define SIP_RESPONSE                                                    \
+	"SIP/2.0 100 Trying\r\n"                                            \
+	"Call-ID: " SIP_CALL_ID "\r\n"                                   \
+	"X: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n\r\n"
+
+PKTGEN("tc", "nodeport_overlay_sip_reply")
+int nodeport_overlay_sip_reply_pktgen(struct __ctx_buff *ctx)
+{
+	struct pktgen builder;
+	struct udphdr *udp;
+	void *data;
+
+	pktgen__init(&builder, ctx);
+	udp = pktgen__push_ipv4_udp_packet(&builder,
+					   (__u8 *)zero_mac, (__u8 *)zero_mac,
+					   SIP_PEER_IP, SIP_VIP_IP,
+					   SIP_PEER_PORT, SIP_PORT);
+	if (!udp)
+		return TEST_ERROR;
+
+	data = pktgen__push_data(&builder, SIP_RESPONSE,
+				 sizeof(SIP_RESPONSE) - 1);
+	if (!data)
+		return TEST_ERROR;
+
+	pktgen__finish(&builder);
+	return 0;
+}
+
+SETUP("tc", "nodeport_overlay_sip_reply")
+int nodeport_overlay_sip_reply_setup(struct __ctx_buff *ctx)
+{
+	struct ipv4_ct_tuple reverse = {
+		.saddr = SIP_PEER_IP,
+		.daddr = SIP_VIP_IP,
+		.sport = SIP_PEER_PORT,
+		.dport = SIP_PORT,
+		.nexthdr = IPPROTO_UDP,
+		.flags = TUPLE_F_IN,
+		.sip_call_id_hash = SIP_CALL_ID_HASH,
+	};
+	struct ipv4_nat_entry state = {
+		.to_daddr = SIP_LB3_IP,
+		.to_dport = SIP_LB3_PORT,
+	};
+	__u16 revnat_id = 99;
+
+	map_update_elem(&cilium_snat_v4_external, &reverse, &state, BPF_ANY);
+	lb_v4_add_service_sip(SIP_VIP_IP, SIP_PORT, IPPROTO_UDP, 1, revnat_id);
+	lb_v4_add_backend(SIP_VIP_IP, SIP_PORT, 1, 124, SIP_LB4_IP,
+			  SIP_LB3_PORT, IPPROTO_UDP, 0);
+
+	/* Both destinations are routable so the final address reveals which
+	 * branch was selected even if the test's mock redirect terminates it.
+	 */
+	ipcache_v4_add_entry(SIP_LB3_IP, 0, CLIENT_SEC_IDENTITY, 0, 0);
+	ipcache_v4_add_entry(SIP_LB4_IP, 0, BACKEND_SEC_IDENTITY, 0, 0);
+
+	return overlay_receive_packet(ctx);
+}
+
+CHECK("tc", "nodeport_overlay_sip_reply")
+int nodeport_overlay_sip_reply_check(const struct __ctx_buff *ctx)
+{
+	void *data, *data_end;
+	struct iphdr *ip4;
+	struct udphdr *udp;
+
+	test_init();
+	data = (void *)(long)ctx_data(ctx);
+	data_end = (void *)(long)ctx->data_end;
+	if (data + sizeof(__u32) + sizeof(struct ethhdr) + sizeof(struct iphdr) +
+	    sizeof(struct udphdr) > data_end)
+		test_fatal("SIP overlay reply packet out of bounds");
+
+	ip4 = data + sizeof(__u32) + sizeof(struct ethhdr);
+	udp = (void *)ip4 + sizeof(*ip4);
+	if (ip4->daddr != SIP_LB3_IP)
+		test_fatal("SIP overlay reply selected LB4 service backend");
+	if (udp->dest != SIP_LB3_PORT)
+		test_fatal("SIP overlay reply did not restore LB3 port");
 
 	test_finish();
 }

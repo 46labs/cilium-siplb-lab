@@ -723,8 +723,28 @@ snat_v4_needs_masquerade(struct __ctx_buff *ctx __maybe_unused,
 			 * initiated the connection, so no need to SNAT the
 			 * reply.
 			 */
-			if (ct_is_reply4(get_ct_map4(tuple), tuple))
+			if (ct_is_reply4(get_ct_map4(tuple), tuple)) {
+#if defined(ENABLE_EGRESS_GATEWAY_COMMON)
+				/* A SIP reply sent by an LB which is local to the egress
+				 * gateway still needs SNAT. Besides translating the source,
+				 * this creates the Call-ID reverse NAT entry used to pin
+				 * subsequent packets to this LB.
+				 */
+				if (egress_gw_snat_needed_hook(tuple->saddr, tuple->daddr,
+							      ip4->tos, &target->addr,
+							      &target->ifindex,
+							      &target->sip_needed,
+							      &target->sip_port) &&
+				    target->sip_needed) {
+					if (target->addr == EGRESS_GATEWAY_NO_EGRESS_IP)
+						return DROP_NO_EGRESS_IP;
+
+					target->egress_gateway = true;
+					return NAT_NEEDED;
+				}
+#endif
 				return NAT_PUNT_TO_STACK;
+			}
 
 			/* SNAT code has its own port extraction logic: */
 			tuple->dport = 0;
@@ -1186,6 +1206,9 @@ snat_v4_rev_nat(struct __ctx_buff *ctx, const struct ipv4_nat_target *target,
 
 	snat_v4_init_tuple(ip4, NAT_DIR_INGRESS, &tuple);
 	tuple.sip_call_id_hash = sip_inspect(ctx);
+	/* sip_inspect() may linearize the skb and invalidate packet pointers. */
+	if (!revalidate_data(ctx, &data, &data_end, &ip4))
+		return DROP_INVALID;
 
 	off = ((void *)ip4 - data) + ipv4_hdrlen(ip4);
 	switch (tuple.nexthdr) {

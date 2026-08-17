@@ -2992,6 +2992,10 @@ static __always_inline int nodeport_lb4(struct __ctx_buff *ctx,
 	l4_off = ETH_HLEN + ipv4_hdrlen(ip4);
 
 	tuple.sip_call_id_hash = sip_inspect(ctx);
+	sip_debug_record(ctx, 20, 0, tuple.sip_call_id_hash, 0);
+	/* sip_inspect() may linearize the skb and invalidate packet pointers. */
+	if (!revalidate_data(ctx, &data, &data_end, &ip4))
+		return DROP_INVALID;
 	ret = lb4_extract_tuple(ctx, ip4, fraginfo, l4_off, &tuple);
 	if (IS_ERR(ret)) {
 		if (ret == DROP_UNSUPP_SERVICE_PROTO) {
@@ -3029,6 +3033,9 @@ static __always_inline int nodeport_lb4(struct __ctx_buff *ctx,
 
 				ipv4_ct_tuple_swap_ports(&nat_tuple);
 				state = snat_v4_lookup(&nat_tuple);
+				sip_debug_record(ctx, 21, state ? 1 : 0,
+						 tuple.sip_call_id_hash,
+						 state ? state->to_daddr : 0);
 				if (state != NULL) {
 					ctx_store_meta(ctx, CB_SRC_LABEL, src_sec_identity);
 					return tail_call_internal(ctx, CILIUM_CALL_IPV4_NODEPORT_NAT_INGRESS, ext_err);
